@@ -1,0 +1,55 @@
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: kcp-syncer
+  namespace: {{ .Namespace }}
+  labels:
+    app: kcp-syncer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kcp-syncer
+  template:
+    metadata:
+      labels:
+        app: kcp-syncer
+    spec:
+      serviceAccountName: kcp-syncer
+      containers:
+      - name: kcp-syncer
+        image: {{ .Image }}
+        args:
+          - "/syncer"
+          - "--workload-cluster-name={{ .Cluster }}"
+          - "--from_cluster={{ .LogicalCluster }}"
+          - "--from_kubeconfig=/kcp-syncer-config/kubeconfig"
+          - "--resources=configmaps"
+          - "--resources=deployments.apps"
+          - "--resources=secrets"
+          - "--resources=serviceaccounts"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          privileged: false
+          runAsNonRoot: true
+        volumeMounts:
+{{- if .CertsEnabled }}
+        - name: kcp-syncer-clientcerts
+          mountPath: "/kcp-syncer-certs"
+          readOnly: true
+{{- end }}
+        - name: kcp-syncer-config
+          mountPath: /kcp-syncer-config
+          readOnly: true
+      volumes:
+{{- if .CertsEnabled }}
+      - name: kcp-syncer-clientcerts
+        secret:
+          secretName: {{ .AddonName }}-kcp.dev-syncer-signer-client-cert
+{{- end }}
+      - name: kcp-syncer-config
+        secret:
+          secretName: kcp-syncer-config

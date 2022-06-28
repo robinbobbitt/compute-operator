@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	singaporev1alpha1 "github.com/stolostron/compute-operator/api/singapore/v1alpha1"
+	"github.com/stolostron/compute-operator/controllers/synceraddons"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	clusteradmapply "open-cluster-management.io/clusteradm/pkg/helpers/apply"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+	"open-cluster-management.io/addon-framework/pkg/addonmanager"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
@@ -147,6 +149,22 @@ func GetHubClusters(ctx context.Context, mgr ctrl.Manager, kubeClient kubernetes
 		// Add MCE cluster to manager
 		if err := mgr.Add(hubCluster); err != nil {
 			setupLog.Error(err, "unable to add MCE cluster")
+			return nil, err
+		}
+
+		// Set up kcp syncer addonmanager and agent
+		aomgr, err := addonmanager.New(hubKubeconfig)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := aomgr.AddAgent(synceraddons.NewSyncerAddon(cmaddonName, c.ca, c.key, workspaceConfig, c.eventRecorder)); err != nil {
+			return nil, err
+		}
+
+		addonCtx, cancel := context.WithCancel(ctx)
+		if err := mgr.Start(addonCtx); err != nil {
+			cancel()
 			return nil, err
 		}
 

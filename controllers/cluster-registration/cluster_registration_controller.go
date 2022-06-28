@@ -153,9 +153,15 @@ func (r *RegisteredClusterReconciler) Reconcile(computeContextOri context.Contex
 		return ctrl.Result{}, err
 	}
 
-	// sync ManagedClusterAddOn, ManagedServiceAccount, ...
-	if err := r.syncManagedServiceAccount(computeContext, ctx, regCluster, &managedCluster, &hubCluster); err != nil {
-		logger.Error(err, "failed to sync ManagedClusterAddOn, ManagedServiceAccount, ...")
+	// sync SyncTarget
+	if err := r.syncSyncTarget(computeContext, ctx, regCluster, &managedCluster, &hubCluster); err != nil {
+		logger.Error(err, "failed to sync SyncTarget")
+		return ctrl.Result{}, err
+	}
+
+	// sync ManagedClusterAddOn
+	if err := r.syncManagedClusterAddOn(computeContext, ctx, regCluster, &managedCluster, &hubCluster); err != nil {
+		logger.Error(err, "failed to sync ManagedClusterAddOn")
 		return ctrl.Result{}, err
 	}
 
@@ -288,6 +294,13 @@ func (r *RegisteredClusterReconciler) updateImportCommand(computeContext context
 		return err
 	}
 
+	return nil
+}
+
+func (r *RegisteredClusterReconciler) syncSyncTarget(computeContext context.Context, ctx context.Context, regCluster *singaporev1alpha1.RegisteredCluster, managedCluster *clusterapiv1.ManagedCluster, hubCluster *helpers.HubInstance) error {
+	logger := r.Log.WithName("syncSyncTarget").WithValues("namespace", regCluster.Namespace, "name", regCluster.Name, "managed cluster name", managedCluster.Name)
+
+	logger.V(1).Info("sync target creation coming soon... need https://github.com/kcp-dev/kcp/issues/1219")
 	return nil
 }
 
