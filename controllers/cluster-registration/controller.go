@@ -89,7 +89,7 @@ func (o *managerOptions) run() {
 
 	setupLog.Info("Setup Manager")
 
-	// hub clients
+	// controller cluster clients
 	kubeClient := kubernetes.NewForConfigOrDie(ctrl.GetConfigOrDie())
 	dynamicClient := dynamic.NewForConfigOrDie(ctrl.GetConfigOrDie())
 	// apiExtensionClient := apiextensionsclient.NewForConfigOrDie(ctrl.GetConfigOrDie())
@@ -219,6 +219,7 @@ func (o *managerOptions) run() {
 		Log:                       ctrl.Log.WithName("controllers").WithName("RegistredCluster"),
 		Scheme:                    scheme,
 		HubClusters:               hubInstances,
+		ComputeConfig:             cfg,
 		ComputeKubeClient:         computeKubeClient,
 		ComputeDynamicClient:      computeDynamicClient,
 		ComputeAPIExtensionClient: computeApiExtensionClient,

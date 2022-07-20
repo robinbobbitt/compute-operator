@@ -4,8 +4,9 @@ package registeredcluster
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -13,14 +14,13 @@ import (
 	"github.com/go-logr/logr"
 	giterrors "github.com/pkg/errors"
 
-	b64 "encoding/base64"
-
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
 	// corev1 "k8s.io/api/core/v1"
@@ -66,12 +66,15 @@ const (
 	ManagedClusterAddOnName         string = "managed-serviceaccount"
 )
 
+const defaultSyncerImage = "ghcr.io/kcp-dev/kcp/syncer:main"
+
 // RegisteredClusterReconciler reconciles a RegisteredCluster object
 type RegisteredClusterReconciler struct {
 	client.Client
 	// KubeClient         kubernetes.Interface
 	// DynamicClient      dynamic.Interface
 	// APIExtensionClient apiextensionsclient.Interface
+	ComputeConfig             *rest.Config
 	ComputeKubeClient         kubernetes.Interface
 	ComputeDynamicClient      dynamic.Interface
 	ComputeAPIExtensionClient apiextensionsclient.Interface
@@ -151,9 +154,22 @@ func (r *RegisteredClusterReconciler) Reconcile(computeContextOri context.Contex
 		return ctrl.Result{}, err
 	}
 
-	// sync ManagedClusterAddOn, ManagedServiceAccount, ...
-	if err := r.syncManagedServiceAccount(computeContext, ctx, regCluster, &managedCluster, &hubCluster); err != nil {
-		logger.Error(err, "failed to sync ManagedClusterAddOn, ManagedServiceAccount, ...")
+	// sync SyncTarget
+	if err := r.syncSyncTarget(computeContext, ctx, regCluster, &managedCluster, &hubCluster); err != nil {
+		logger.Error(err, "failed to sync SyncTarget")
+		return ctrl.Result{}, err
+	}
+
+	// sync kcp-syncer service account (currently one per location workspace) in kcp workspace
+	token := ""
+	if token, err = r.syncServiceAccount(computeContext, ctx, regCluster, &managedCluster, &hubCluster); err != nil {
+		logger.Error(err, "failed to sync ServiceAccount")
+		return ctrl.Result{}, err
+	}
+
+	// sync kcp-syncer deployment and supporting resources
+	if err := r.syncKcpSyncer(computeContext, ctx, regCluster, &managedCluster, &hubCluster, token); err != nil {
+		logger.Error(err, "failed to sync kcp-syncer")
 		return ctrl.Result{}, err
 	}
 
@@ -167,7 +183,9 @@ func (r *RegisteredClusterReconciler) Reconcile(computeContextOri context.Contex
 }
 
 func (r *RegisteredClusterReconciler) updateRegisteredClusterStatus(computeContext context.Context, regCluster *singaporev1alpha1.RegisteredCluster, managedCluster *clusterapiv1.ManagedCluster) error {
-
+	r.Log.V(4).Info("updateRegisteredClusterStatus",
+		"regcluster", regCluster.Name,
+		"managedCluster", managedCluster.Name)
 	patch := client.MergeFrom(regCluster.DeepCopy())
 	if managedCluster.Status.Conditions != nil {
 		regCluster.Status.Conditions = helpers.MergeStatusConditions(regCluster.Status.Conditions, managedCluster.Status.Conditions...)
@@ -190,7 +208,9 @@ func (r *RegisteredClusterReconciler) updateRegisteredClusterStatus(computeConte
 	if clusterID, ok := managedCluster.GetLabels()["clusterID"]; ok {
 		regCluster.Status.ClusterID = clusterID
 	}
-
+	r.Log.V(4).Info("updateRegisteredClusterStatus",
+		"patch", patch,
+		"regcluster", regCluster.Status)
 	if err := r.Client.Status().Patch(computeContext, regCluster, patch); err != nil {
 		return giterrors.WithStack(err)
 	}
@@ -263,7 +283,10 @@ func (r *RegisteredClusterReconciler) updateImportCommand(computeContext context
 	}
 
 	importCommand := "echo \"" + strings.TrimSpace(string(crdsv1Yaml)) + "\" | base64 --decode | kubectl apply -f - && sleep 2 && echo \"" + strings.TrimSpace(string(importYaml)) + "\" | base64 --decode | kubectl apply -f -"
-
+	// r.Log.V(4).Info("!!!!!!!!!!!importCommand",
+	// 	"importCommand", importCommand)
+	// r.Log.V(4).Info("!!!!!!!!!!!importCommand",
+	// 	"importCommand sprintf", fmt.Sprintf("%v", importCommand))
 	values := struct {
 		Name          string
 		Namespace     string
@@ -275,12 +298,11 @@ func (r *RegisteredClusterReconciler) updateImportCommand(computeContext context
 		ImportCommand: importCommand,
 		ClusterName:   regCluster.ClusterName,
 	}
-
-	r.Log.V(4).Info("create secret on compute",
+	_, err = applier.ApplyDirectly(readerDeploy, values, false, "", files...)
+	r.Log.V(4).Info("AFTER create secret on compute",
 		"cluster", regCluster.ClusterName,
 		"namespace", regCluster.Namespace,
 		"name", regCluster.Name)
-	_, err = applier.ApplyDirectly(readerDeploy, values, false, "", files...)
 	if err != nil {
 		return giterrors.WithStack(err)
 	}
@@ -300,63 +322,217 @@ func (r *RegisteredClusterReconciler) updateImportCommand(computeContext context
 	return nil
 }
 
-func (r *RegisteredClusterReconciler) syncManagedServiceAccount(computeContext context.Context, ctx context.Context, regCluster *singaporev1alpha1.RegisteredCluster, managedCluster *clusterapiv1.ManagedCluster, hubCluster *helpers.HubInstance) error {
-	logger := r.Log.WithName("syncManagedServiceAccount").WithValues("namespace", regCluster.Namespace, "name", regCluster.Name, "managed cluster name", managedCluster.Name)
+func (r *RegisteredClusterReconciler) syncSyncTarget(computeContext context.Context, ctx context.Context, regCluster *singaporev1alpha1.RegisteredCluster, managedCluster *clusterapiv1.ManagedCluster, hubCluster *helpers.HubInstance) error {
+	logger := r.Log.WithName("syncSyncTarget").WithValues("namespace", regCluster.Namespace, "name", regCluster.Name, "managed cluster name", managedCluster.Name)
+
+	logger.V(1).Info("sync target creation coming soon... need https://github.com/kcp-dev/kcp/issues/1219 ?")
+	return nil
+}
+
+func (r *RegisteredClusterReconciler) syncServiceAccount(computeContext context.Context,
+	ctx context.Context,
+	regCluster *singaporev1alpha1.RegisteredCluster,
+	managedCluster *clusterapiv1.ManagedCluster,
+	hubCluster *helpers.HubInstance) (string, error) {
+
+	r.Log.V(4).Info("syncServiceAccount",
+		"registered cluster", regCluster.Name)
+
+	// Create the ServiceAccount if it doesn't yet exist
+	saName := helpers.GetSyncerServiceAccountName()
+
+	// sa, err := r.ComputeKubeClient.Cluster(logicalcluster.New(regCluster.Spec.Location)).CoreV1().ServiceAccounts("default").Get(ctx, saName, metav1.GetOptions{})
+	locationContext := logicalcluster.WithCluster(computeContext, logicalcluster.New(regCluster.Spec.Location))
+	sa, err := r.ComputeKubeClient.CoreV1().ServiceAccounts("default").Get(locationContext, saName, metav1.GetOptions{})
+	if err != nil {
+		if !k8serrors.IsNotFound(err) {
+			return "", err
+		}
+
+		sa = &corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: saName,
+			},
+		}
+		r.Log.V(4).Info("syncServiceAccount",
+			"creating service account", regCluster.Name) // TODO - fix all these crummy loggins
+		// sa, err = r.ComputeKubeClient.Cluster(logicalcluster.New(regCluster.Spec.Location)).CoreV1().ServiceAccounts("default").Create(ctx, sa, metav1.CreateOptions{})
+		sa, err = r.ComputeKubeClient.CoreV1().ServiceAccounts("default").Create(locationContext, sa, metav1.CreateOptions{})
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// Sync the ClusterRole and ClusterRoleBinding
+
+	applier := clusteradmapply.NewApplierBuilder().
+		WithClient(r.ComputeKubeClient,
+			r.ComputeAPIExtensionClient,
+			r.ComputeDynamicClient).
+		// WithOwner(regCluster, false, true, r.Scheme). //TODO - add owner synctarget
+		WithContext(locationContext).
+		Build()
 
 	readerDeploy := resources.GetScenarioResourcesReader()
 
 	files := []string{
-		"cluster-registration/managed_cluster_addon.yaml",
-		"cluster-registration/managed_service_account.yaml",
+		"cluster-registration/kcp_syncer_clusterrole.yaml",
+		"cluster-registration/kcp_syncer_clusterrolebinding.yaml",
 	}
 
+	// 	"importCommand sprintf", fmt.Sprintf("%v", importCommand))
 	values := struct {
-		ManagedClusterAddOnName         string
-		ServiceAccountName              string
-		Namespace                       string
-		RegisteredClusterNameLabel      string
-		RegisteredClusterNamespaceLabel string
-		RegisteredClusterName           string
-		RegisteredClusterNamespace      string
+		KcpSyncerName      string
+		SyncTargetName     string
+		ServiceAccountName string
 	}{
-		ManagedClusterAddOnName:         ManagedClusterAddOnName,
-		ServiceAccountName:              ManagedServiceAccountName,
-		Namespace:                       managedCluster.Name,
-		RegisteredClusterNameLabel:      RegisteredClusterNamelabel,
-		RegisteredClusterNamespaceLabel: RegisteredClusterNamespacelabel,
-		RegisteredClusterName:           regCluster.Name,
-		RegisteredClusterNamespace:      regCluster.Namespace,
+		KcpSyncerName:      helpers.GetSyncerName(regCluster.Name),
+		SyncTargetName:     regCluster.Name, // TODO - Get this from SyncTarget.Name
+		ServiceAccountName: saName,
 	}
+	fmt.Println("Sleep Start.....")
 
-	logger.V(1).Info("applying managedclusteraddon and managedserviceaccount")
+	// Calling Sleep method
+	time.Sleep(10 * time.Second)
 
-	applier := hubCluster.ApplierBuilder.Build()
-	_, err := applier.ApplyCustomResources(readerDeploy, values, false, "", files...)
+	// Printed after sleep is over
+	fmt.Println("Sleep Over.....")
+	_, err = applier.ApplyDirectly(readerDeploy, values, false, "", files...)
+	fmt.Println("AFTER Sleep Start.....")
+
+	// Calling Sleep method
+	time.Sleep(10 * time.Second)
+
+	// Printed after sleep is over
+	fmt.Println("AFTER Sleep Over.....")
+	r.Log.V(4).Info("AFTER create clusterrole and clusterrolebinding",
+		"cluster", regCluster.ClusterName,
+		"namespace", regCluster.Namespace,
+		"name", regCluster.Name)
 	if err != nil {
-		return giterrors.WithStack(err)
+		return "", giterrors.WithStack(err)
 	}
 
-	// If cluster has joined, sync the ManifestWork to create the roles and bindings for the service account
+	// Return the ServiceAccount token
+	token, err := r.getKcpSyncerSAToken(computeContext, regCluster, sa)
+	return token, err
+
+}
+
+func (r *RegisteredClusterReconciler) getKcpSyncerSAToken(computeContext context.Context, regCluster *singaporev1alpha1.RegisteredCluster, sa *corev1.ServiceAccount) (string, error) {
+	// TODO - where do I need this context?
+	// computeContext = kcpclient.WithCluster(computeContext, logicalcluster.New(regCluster.Spec.Location))
+
+	r.Log.V(4).Info("getKcpSyncerSAToken",
+		"service account", sa.Name) // TODO - fix all these crummy loggins
+
+	saName := helpers.GetSyncerServiceAccountName()
+	locationContext := logicalcluster.WithCluster(computeContext, logicalcluster.New(regCluster.Spec.Location))
+
+	for _, secretRef := range sa.Secrets {
+		r.Log.V(4).Info("checking secret",
+			"secret", secretRef.Name)
+		if !strings.HasPrefix(secretRef.Name, saName) {
+			continue
+		}
+		r.Log.V(4).Info("reading secret",
+			"secret", secretRef.Name)
+
+		secret, err := r.ComputeKubeClient.CoreV1().Secrets("default").Get(locationContext, secretRef.Name, metav1.GetOptions{})
+		if err != nil {
+			r.Log.Error(err,
+				"secret", secretRef.Name)
+			continue
+		}
+		r.Log.V(4).Info("read secret",
+			"secret", secretRef.Name)
+
+		if secret.Type != corev1.SecretTypeServiceAccountToken {
+			r.Log.V(4).Info("wronog secret type",
+				"type", secret.Type)
+
+			continue
+		}
+
+		token, ok := secret.Data["token"]
+		if !ok {
+			r.Log.V(4).Info("wrong data",
+				"data", secret.Data)
+			continue
+		}
+		if len(token) == 0 {
+			continue
+		}
+
+		return string(token), nil
+	}
+
+	return "", fmt.Errorf("failed to get the token of workspace sa %s in namespace default", saName) // TODO - better error with more specific context
+}
+
+func getSyncerImage() string {
+	syncerImage := os.Getenv("KCP_SYNCER_IMAGE")
+	if len(syncerImage) > 0 {
+		return syncerImage
+	}
+	return defaultSyncerImage
+}
+
+func (r *RegisteredClusterReconciler) syncKcpSyncer(computeContext context.Context, ctx context.Context, regCluster *singaporev1alpha1.RegisteredCluster, managedCluster *clusterapiv1.ManagedCluster, hubCluster *helpers.HubInstance, token string) error {
+	logger := r.Log.WithName("syncKcpSyncer").WithValues("namespace", regCluster.Namespace, "name", regCluster.Name, "managed cluster name", managedCluster.Name)
+
+	// If cluster has joined, sync the ManifestWork to create the kcp-syncer deployment and supporting resources
 	if status, ok := helpers.GetConditionStatus(regCluster.Status.Conditions, clusterapiv1.ManagedClusterConditionJoined); ok && status == metav1.ConditionTrue {
 
-		msa := &authv1alpha1.ManagedServiceAccount{}
+		readerDeploy := resources.GetScenarioResourcesReader()
 
-		if err := hubCluster.Client.Get(
-			ctx,
-			types.NamespacedName{Namespace: managedCluster.Name, Name: ManagedServiceAccountName},
-			msa,
-		); err != nil {
-			r.Log.Error(giterrors.WithStack(err), "managedServiceAccount", "namespace", managedCluster.Name, "name", ManagedServiceAccountName)
-			return giterrors.WithStack(err)
-		}
-		applier := hubCluster.ApplierBuilder.
-			WithOwner(msa, true, true, hubCluster.Client.Scheme()).
-			Build()
+		applier := hubCluster.ApplierBuilder.Build()
 
-		files = []string{
-			"cluster-registration/service_account_roles.yaml",
+		syncerName := helpers.GetSyncerName(regCluster.Name)
+
+		kcpURL, err := url.Parse(r.ComputeConfig.Host)
+		if err != nil {
+			return err
 		}
-		_, err := applier.ApplyCustomResources(readerDeploy, values, false, "", files...)
+
+		logger.V(1).Info("syncKcpSyncer", "url path", kcpURL.Path)
+		logger.V(1).Info("syncKcpSyncer", "reg cluster location", regCluster.Spec.Location)
+
+		values := struct {
+			KcpSyncerName                   string
+			KcpToken                        string
+			KcpServer                       string
+			SyncTargetName                  string
+			ManagedClusterName              string
+			RegisteredClusterNameLabel      string
+			RegisteredClusterNamespaceLabel string
+			RegisteredClusterName           string
+			RegisteredClusterNamespace      string
+			LogicalClusterLabel             string
+			LogicalCluster                  string
+			Image                           string
+		}{
+			KcpSyncerName:                   syncerName,
+			KcpToken:                        token,
+			KcpServer:                       fmt.Sprintf("%s://%s", kcpURL.Scheme, kcpURL.Host),
+			SyncTargetName:                  regCluster.Name, // TODO - Get this from SyncTarget.Name
+			ManagedClusterName:              managedCluster.Name,
+			RegisteredClusterNameLabel:      RegisteredClusterNamelabel,
+			RegisteredClusterNamespaceLabel: RegisteredClusterNamespacelabel,
+			RegisteredClusterName:           regCluster.Name,
+			RegisteredClusterNamespace:      regCluster.Namespace,
+			LogicalCluster:                  regCluster.Spec.Location,
+			LogicalClusterLabel:             strings.ReplaceAll(regCluster.Spec.Location, ":", "_"),
+			Image:                           getSyncerImage(),
+		}
+
+		logger.V(1).Info("values", "Values", values)
+
+		files := []string{
+			"cluster-registration/kcp_syncer_manifestwork.yaml",
+		}
+
+		_, err = applier.ApplyCustomResources(readerDeploy, values, false, "", files...)
 		if err != nil {
 			return giterrors.WithStack(err)
 		}
@@ -364,18 +540,16 @@ func (r *RegisteredClusterReconciler) syncManagedServiceAccount(computeContext c
 		work := &manifestworkv1.ManifestWork{}
 
 		err = hubCluster.Client.Get(ctx,
-			types.NamespacedName{Name: ManagedServiceAccountName, Namespace: managedCluster.Name},
+			types.NamespacedName{Name: values.KcpSyncerName, Namespace: managedCluster.Name},
 			work)
+
 		if err != nil {
 			return giterrors.WithStack(err)
 		}
 
 		if status, ok := helpers.GetConditionStatus(work.Status.Conditions, string(manifestworkv1.ManifestApplied)); ok && status == metav1.ConditionTrue {
-			logger.V(1).Info("manifestwork applied. preparing secret...")
-			err := r.syncManagedClusterKubeconfig(computeContext, ctx, regCluster, managedCluster, hubCluster)
-			if err != nil {
-				return giterrors.WithStack(err)
-			}
+			logger.V(1).Info("manifestwork applied. should update status...")
+			//TODO - update status
 		}
 	}
 	return nil
@@ -383,6 +557,7 @@ func (r *RegisteredClusterReconciler) syncManagedServiceAccount(computeContext c
 
 func (r *RegisteredClusterReconciler) processRegclusterDeletion(ctx context.Context, regCluster *singaporev1alpha1.RegisteredCluster, managedCluster *clusterapiv1.ManagedCluster, hubCluster *helpers.HubInstance) (ctrl.Result, error) {
 
+	// TODO - update this
 	manifestwork := &manifestworkv1.ManifestWork{}
 	err := hubCluster.Client.Get(ctx,
 		types.NamespacedName{
@@ -468,73 +643,6 @@ func (r *RegisteredClusterReconciler) processRegclusterDeletion(ctx context.Cont
 	r.Log.Info("deleted managedcluster", "name", managedCluster.Name)
 
 	return ctrl.Result{}, nil
-}
-
-func (r *RegisteredClusterReconciler) syncManagedClusterKubeconfig(computeContext context.Context, ctx context.Context, regCluster *singaporev1alpha1.RegisteredCluster, managedCluster *clusterapiv1.ManagedCluster, hubCluster *helpers.HubInstance) error {
-	logger := r.Log.WithName("syncManagedClusterKubeconfig").WithValues("namespace", regCluster.Namespace, "name", regCluster.Name, "managed cluster name", managedCluster.Name)
-	// Retrieve the API URL
-
-	if managedCluster.Spec.ManagedClusterClientConfigs == nil && len(managedCluster.Spec.ManagedClusterClientConfigs) == 0 {
-		return errors.New("ManagedClusterClientConfigs not configured as expected")
-	}
-	apiUrl := managedCluster.Spec.ManagedClusterClientConfigs[0].URL
-
-	// Retrieve the secret containing the managedserviceaccount token
-	token := &corev1.Secret{}
-
-	err := hubCluster.Client.Get(ctx,
-		types.NamespacedName{Name: ManagedServiceAccountName, Namespace: managedCluster.Name},
-		token)
-	if err != nil {
-		return giterrors.WithStack(err)
-	}
-
-	readerDeploy := resources.GetScenarioResourcesReader()
-	applier := clusteradmapply.NewApplierBuilder().
-		WithClient(r.ComputeKubeClient,
-			r.ComputeAPIExtensionClient,
-			r.ComputeDynamicClient).
-		WithContext(computeContext).
-		WithOwner(regCluster, false, true, r.Scheme).
-		Build()
-
-	files := []string{
-		"cluster-registration/kubeconfig_secret.yaml",
-	}
-
-	secretName := fmt.Sprintf("%s-cluster-secret", regCluster.Name)
-	values := struct {
-		ApiURL      string
-		Token       string
-		CABundle    string
-		SecretName  string
-		Namespace   string
-		ClusterName string
-	}{
-		ApiURL:      apiUrl,
-		Token:       string(token.Data["token"]),
-		CABundle:    b64.StdEncoding.EncodeToString(token.Data["ca.crt"]),
-		SecretName:  secretName,
-		ClusterName: regCluster.Name,
-		Namespace:   regCluster.Namespace,
-	}
-
-	_, err = applier.ApplyCustomResources(readerDeploy, values, false, "", files...)
-	if err != nil {
-		return giterrors.WithStack(err)
-	}
-	logger.V(1).Info("cluster kubeconfig synced")
-
-	// Patch the RegisteredCluster status with reference to the kubeconfig secret
-	patch := client.MergeFrom(regCluster.DeepCopy())
-	regCluster.Status.ClusterSecretRef = corev1.LocalObjectReference{
-		Name: secretName,
-	}
-	if err := r.Client.Status().Patch(computeContext, regCluster, patch); err != nil {
-		return giterrors.WithStack(err)
-	}
-
-	return nil
 }
 
 func (r *RegisteredClusterReconciler) createManagedCluster(ctx context.Context, regCluster *singaporev1alpha1.RegisteredCluster, hubCluster *helpers.HubInstance) error {
@@ -634,6 +742,7 @@ func managedClusterPredicate() predicate.Predicate {
 	}
 }
 
+// TODO - not sure what we want to do at this point with manifestWorkPredicate... maybe update the status?
 func manifestWorkPredicate() predicate.Predicate {
 	f := func(obj client.Object) bool {
 		log := ctrl.Log.WithName("controllers").WithName("RegisteredCluster").WithName("manifestWorkPredicate").WithValues("namespace", obj.GetNamespace(), "name", obj.GetName())
